@@ -243,23 +243,11 @@ def _extract_hhmm(time_str: str) -> str | None:
     return None
 
 
-def verify_with_serpapi(
-    origin: str, dest: str, depart_date: str, return_date: str,
-    api_key: str, ff_row: dict,
-) -> dict:
-    """Verify a specific fast-flights result against live SerpApi data.
-
-    Matches the flight by departure time, arrival time, stop count, and airline
-    before comparing prices.  Simply finding the cheapest price on the same route
-    is not sufficient — it may be a completely different flight.
-
-    Returns one of:
-        {'found': True,  'price': float}          — matched; price is SerpApi's price
-        {'found': False, 'price': None}           — no matching flight in results
-        {'found': False, 'price': None, 'error'}  — API call failed
-    """
+def _fetch_serpapi_flights(
+    origin: str, dest: str, depart_date: str, return_date: str, api_key: str,
+) -> list[dict] | None:
+    """Single SerpApi call — returns all flights or None on failure."""
     import requests
-
     params = {
         "engine":        "google_flights",
         "departure_id":  origin,
@@ -274,43 +262,115 @@ def verify_with_serpapi(
     }
     if return_date:
         params["return_date"] = return_date
-
     try:
         resp = requests.get("https://serpapi.com/search", params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
-            return {"found": False, "price": None, "error": data["error"]}
-        all_flights = data.get("best_flights", []) + data.get("other_flights", [])
+            print(f"  SerpApi error: {data['error']}")
+            return None
+        return data.get("best_flights", []) + data.get("other_flights", [])
     except Exception as exc:
-        return {"found": False, "price": None, "error": str(exc)}
+        print(f"  SerpApi fetch failed ({exc})")
+        return None
 
-    # Fingerprint of the fast-flights row we want to match
-    ff_dep     = _extract_hhmm(ff_row.get("departure", ""))
-    ff_arr     = _extract_hhmm(ff_row.get("arrival", ""))
-    ff_stops   = ff_row.get("stops_int", 99)
+
+def _match_ff_in_serpapi(ff_row: dict, sa_flights: list[dict]) -> dict:
+    """Match a specific fast-flights row against a list of SerpApi flights.
+
+    Matches on departure time, arrival time, stop count, and airline overlap.
+    Returns {'found': True, 'price': float, 'flight': dict} or {'found': False, 'price': None}.
+    """
+    ff_dep      = _extract_hhmm(ff_row.get("departure", ""))
+    ff_arr      = _extract_hhmm(ff_row.get("arrival", ""))
+    ff_stops    = ff_row.get("stops_int", 99)
     ff_airlines = {a.strip().lower()
                    for a in re.split(r",\s*", ff_row.get("airline", "")) if a.strip()}
 
-    for flight in all_flights:
+    for flight in sa_flights:
         legs     = flight.get("flights", [])
         layovers = flight.get("layovers", [])
         if not legs:
             continue
-
-        sa_dep   = _extract_hhmm(legs[0]["departure_airport"].get("time", ""))
-        sa_arr   = _extract_hhmm(legs[-1]["arrival_airport"].get("time", ""))
-        sa_stops = len(layovers)
+        sa_dep      = _extract_hhmm(legs[0]["departure_airport"].get("time", ""))
+        sa_arr      = _extract_hhmm(legs[-1]["arrival_airport"].get("time", ""))
+        sa_stops    = len(layovers)
         sa_airlines = {leg.get("airline", "").strip().lower()
                        for leg in legs if leg.get("airline")}
 
         if (ff_dep and sa_dep and ff_dep == sa_dep
                 and ff_arr and sa_arr and ff_arr == sa_arr
                 and ff_stops == sa_stops
-                and ff_airlines & sa_airlines):          # ≥1 airline in common
-            return {"found": True, "price": float(flight.get("price", 0))}
+                and ff_airlines & sa_airlines):
+            return {"found": True, "price": float(flight.get("price", 0)), "flight": flight}
 
     return {"found": False, "price": None}
+
+
+def _min_to_dur(minutes: int) -> str:
+    h, m = divmod(int(minutes), 60)
+    return f"{h}h {m:02d}m" if m else f"{h}h"
+
+
+def _render_serpapi_flight(flight: dict) -> str:
+    """Render a matched SerpApi flight object as a compact HTML details panel."""
+    legs      = flight.get("flights", [])
+    layovers  = flight.get("layovers", [])
+    total_dur = flight.get("total_duration", 0)
+    price     = flight.get("price", 0)
+
+    items: list[str] = []
+    for i, leg in enumerate(legs):
+        dep = leg.get("departure_airport", {})
+        arr = leg.get("arrival_airport", {})
+        dep_time = dep.get("time", "")[-5:]   # 'YYYY-MM-DD HH:MM' → 'HH:MM'
+        arr_time = arr.get("time", "")[-5:]
+        dep_date = dep.get("time", "")[:10]
+        arr_date = arr.get("time", "")[:10]
+        airline  = leg.get("airline", "")
+        fnum     = leg.get("flight_number", "")
+        leg_dur  = _min_to_dur(leg.get("duration", 0))
+        travel_class = leg.get("travel_class", "")
+
+        # Format date only when it differs from the leg before
+        dep_label = f'{dep.get("id","")} <span class="sa-time">{dep_time}</span>'
+        arr_label = f'{arr.get("id","")} <span class="sa-time">{arr_time}</span>'
+        if dep_date:
+            dep_label += f' <span class="sa-date">{datetime.strptime(dep_date, "%Y-%m-%d").strftime("%b %-d")}</span>'
+        if arr_date:
+            arr_label += f' <span class="sa-date">{datetime.strptime(arr_date, "%Y-%m-%d").strftime("%b %-d")}</span>'
+
+        meta_parts = [p for p in [airline, fnum, travel_class, leg_dur] if p]
+        items.append(
+            f'<div class="sa-leg">'
+            f'<span class="sa-ap">{dep_label}</span>'
+            f'<span class="sa-arrow">→</span>'
+            f'<span class="sa-ap">{arr_label}</span>'
+            f'<span class="sa-meta">{" · ".join(meta_parts)}</span>'
+            f'</div>'
+        )
+
+        if i < len(layovers):
+            lv = layovers[i]
+            lv_dur = _min_to_dur(lv.get("duration", 0))
+            items.append(
+                f'<div class="sa-layover">'
+                f'⏱ {lv.get("id","")} ({lv.get("name","layover")}) — {lv_dur} layover'
+                f'</div>'
+            )
+
+    stops_n   = len(layovers)
+    stops_str = "Nonstop" if stops_n == 0 else f"{stops_n} stop{'s' if stops_n > 1 else ''}"
+    dur_str   = _min_to_dur(total_dur) if total_dur else "—"
+
+    return (
+        f'<div class="sa-panel">'
+        f'<div class="sa-panel-title">SerpApi live data</div>'
+        + "".join(items) +
+        f'<div class="sa-summary">{dur_str} &nbsp;·&nbsp; {stops_str} &nbsp;·&nbsp; '
+        f'<strong>${price:,}</strong></div>'
+        f'</div>'
+    )
 
 
 def _fmt_date_range(dates: list[str]) -> str:
@@ -468,22 +528,30 @@ def render_row(r: dict, rank: int, badges: str, gf_url: str) -> str:
                     else '<span class="source-ff">fast-flights</span>' if api_source == "fast-flights"
                     else "")
 
-    # SerpApi verification badge
-    serpapi_price = r.get("_serpapi_price")
+    # SerpApi verification badge (with expandable details panel when matched)
+    serpapi_price  = r.get("_serpapi_price")
+    serpapi_flight = r.get("_serpapi_flight")
     verify_html = ""
     if serpapi_price is not None:
         delta = serpapi_price - r["price_numeric"]
+        panel_html = _render_serpapi_flight(serpapi_flight) if serpapi_flight else ""
         if abs(delta) <= 50:
+            summary = f'✓ Verified by SerpApi &nbsp;<span class="sa-chevron">▾</span>'
             verify_html = (
-                f'<div class="verify-ok" title="Matched this exact flight in SerpApi at ${serpapi_price:,.0f} — within $50">'
-                f'✓ Verified by SerpApi</div>'
+                f'<details class="verify-details verify-ok-det">'
+                f'<summary>{summary}</summary>'
+                f'{panel_html}'
+                f'</details>'
             )
         else:
             sign = "+" if delta > 0 else ""
+            summary = (f'SerpApi: ${serpapi_price:,.0f} ({sign}{delta:.0f})'
+                       f' &nbsp;<span class="sa-chevron">▾</span>')
             verify_html = (
-                f'<div class="verify-warn" title="Matched this exact flight in SerpApi at ${serpapi_price:,.0f} — '
-                f'${abs(delta):.0f} difference">'
-                f'SerpApi: ${serpapi_price:,.0f} ({sign}{delta:.0f})</div>'
+                f'<details class="verify-details verify-warn-det">'
+                f'<summary>{summary}</summary>'
+                f'{panel_html}'
+                f'</details>'
             )
     elif r.get("_serpapi_no_match"):
         verify_html = (
@@ -772,24 +840,52 @@ body {{
 .source-ff {{ display:inline-block; font-size:9px; font-weight:600; letter-spacing:.3px;
   background:#dbeafe; color:#1d4ed8; border-radius:3px; padding:1px 4px; margin-right:3px; }}
 .gf-note {{ font-size: 10px; color: #94a3b8; margin-top: 4px; line-height: 1.4; }}
-.verify-ok {{
-  display: inline-flex; align-items: center; gap: 4px;
-  font-size: 10px; font-weight: 700; color: #166534;
-  background: #dcfce7; border: 1px solid #86efac;
-  border-radius: 4px; padding: 2px 6px; margin-top: 3px;
-  letter-spacing: .02em;
+.verify-details {{ position: relative; display: block; margin-top: 3px; }}
+.verify-details summary {{
+  display: inline-flex; align-items: center; cursor: pointer;
+  list-style: none; font-size: 10px; font-weight: 700;
+  border-radius: 4px; padding: 2px 6px; user-select: none;
 }}
-.verify-warn {{
-  display: inline-flex; align-items: center; gap: 4px;
-  font-size: 10px; font-weight: 600; color: #92400e;
-  background: #fef3c7; border: 1px solid #fcd34d;
-  border-radius: 4px; padding: 2px 6px; margin-top: 3px;
-}}
+.verify-details summary::-webkit-details-marker {{ display: none; }}
+.verify-ok-det summary {{ color: #166534; background: #dcfce7; border: 1px solid #86efac; letter-spacing:.02em; }}
+.verify-warn-det summary {{ color: #92400e; background: #fef3c7; border: 1px solid #fcd34d; }}
+.sa-chevron {{ font-size: 9px; opacity: .7; }}
 .verify-nomatch {{
   display: inline-flex; align-items: center; gap: 4px;
   font-size: 10px; font-weight: 500; color: #64748b;
   background: #f1f5f9; border: 1px solid #cbd5e1;
   border-radius: 4px; padding: 2px 6px; margin-top: 3px;
+}}
+
+/* ── SerpApi details panel ── */
+.sa-panel {{
+  position: absolute; left: 0; top: calc(100% + 4px); z-index: 200;
+  background: white; border: 1px solid #86efac; border-radius: 8px;
+  padding: 10px 14px; min-width: 360px; max-width: 480px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.13); white-space: nowrap;
+}}
+.verify-warn-det .sa-panel {{ border-color: #fcd34d; }}
+.sa-panel-title {{
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: #64748b; margin-bottom: 8px;
+}}
+.sa-leg {{
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 12px; margin-bottom: 4px; flex-wrap: wrap;
+}}
+.sa-ap {{ font-weight: 700; color: #0f172a; }}
+.sa-time {{ font-family: 'DM Mono', monospace; font-size: 12px; color: #2563eb; font-weight: 600; }}
+.sa-date {{ font-size: 10px; color: #64748b; font-weight: 400; margin-left: 2px; }}
+.sa-arrow {{ color: #94a3b8; flex-shrink: 0; }}
+.sa-meta {{ font-size: 11px; color: #475569; margin-left: auto; padding-left: 8px; }}
+.sa-layover {{
+  font-size: 10px; color: #78716c; background: #fafaf9;
+  border-left: 2px solid #d6d3d1; padding: 2px 6px;
+  margin: 2px 0 4px 8px; border-radius: 0 3px 3px 0;
+}}
+.sa-summary {{
+  font-size: 11px; color: #475569; border-top: 1px solid #e2e8f0;
+  margin-top: 8px; padding-top: 6px;
 }}
 
 /* ── Section ── */
@@ -826,7 +922,7 @@ td {{ padding: 10px 12px; vertical-align: top; }}
 }}
 .td-rank {{ color: #94a3b8; font-size: 12px; text-align: center; padding-top: 12px; }}
 .td-origin {{ font-weight: 700; padding-top: 12px; }}
-.td-price {{ white-space: nowrap; }}
+.td-price {{ white-space: nowrap; position: relative; }}
 .price-val {{ font-size: 15px; font-weight: 800; display: block; margin-bottom: 4px; }}
 .badges {{ display: flex; flex-wrap: wrap; gap: 3px; }}
 .badge {{
@@ -1049,33 +1145,58 @@ def main():
             print(f"No usable rows in {csv_file.name}.")
             continue
 
-        # SerpApi verification: one call for the cheapest fast-flights row with ≤N stops.
-        # Only runs when a SERPAPI_KEY is available (fast-flights is always the primary source).
+        # SerpApi verification — ONE call, match cheapest row per stop-count group.
+        # Uses the anchor row's date (cheapest overall eligible) for the API call,
+        # then tries to match every stop-count group's cheapest row against the
+        # same response, maximising verifications per credit.
         if serpapi_key:
-            ff_rows = [r for r in rows
-                       if r.get("api_source") == "fast-flights"
-                       and r.get("stops_int", 99) <= args.verify_stops]
-            if ff_rows:
-                target = min(ff_rows, key=lambda r: r["price_numeric"])
-                print(f"  Verifying {target['origin']}→{dest} {target['depart_date']} "
-                      f"${target['price_numeric']:,.0f} dep={target.get('departure','?')} "
-                      f"arr={target.get('arrival','?')} via SerpApi …", end=" ", flush=True)
-                result = verify_with_serpapi(
-                    target["origin"], dest,
-                    target["depart_date"], target.get("return_date", ""),
-                    serpapi_key, target,
+            eligible = [r for r in rows
+                        if r.get("api_source") == "fast-flights"
+                        and r.get("stops_int", 99) <= args.verify_stops]
+            if eligible:
+                # Anchor date = cheapest eligible row
+                anchor = min(eligible, key=lambda r: r["price_numeric"])
+                a_dep = anchor["depart_date"]
+                a_ret = anchor.get("return_date", "")
+
+                # One target per stop-count group on the same date pair
+                same_date = [r for r in eligible
+                             if r["depart_date"] == a_dep
+                             and r.get("return_date", "") == a_ret]
+                targets: dict[int, dict] = {}
+                for r in same_date:
+                    s = r["stops_int"]
+                    if s not in targets or r["price_numeric"] < targets[s]["price_numeric"]:
+                        targets[s] = r
+
+                groups_str = ", ".join(
+                    f"{'nonstop' if s == 0 else f'{s}-stop'}" for s in sorted(targets)
                 )
-                if result.get("error"):
-                    print(f"error ({result['error'][:80]})")
-                elif result["found"]:
-                    sa_price = result["price"]
-                    delta = abs(sa_price - target["price_numeric"])
-                    status = "✓ verified" if delta <= 50 else f"⚠ gap ${delta:.0f}"
-                    print(f"SerpApi: ${sa_price:,.0f}  {status}")
-                    target["_serpapi_price"] = sa_price
+                print(f"  Verifying {anchor['origin']}→{dest} {a_dep}  "
+                      f"[{groups_str}]  1 SerpApi call …", end=" ", flush=True)
+
+                sa_flights = _fetch_serpapi_flights(
+                    anchor["origin"], dest, a_dep, a_ret, serpapi_key,
+                )
+                if sa_flights is None:
+                    print("fetch failed")
                 else:
-                    print("flight not found in SerpApi results")
-                    target["_serpapi_no_match"] = True
+                    results_log = []
+                    for s in sorted(targets):
+                        target = targets[s]
+                        result = _match_ff_in_serpapi(target, sa_flights)
+                        label  = "nonstop" if s == 0 else f"{s}-stop"
+                        if result["found"]:
+                            sa_p  = result["price"]
+                            delta = abs(sa_p - target["price_numeric"])
+                            tag   = "✓" if delta <= 50 else "⚠"
+                            results_log.append(f"{label} ${sa_p:,}{tag}")
+                            target["_serpapi_price"]  = sa_p
+                            target["_serpapi_flight"] = result["flight"]
+                        else:
+                            results_log.append(f"{label} ?")
+                            target["_serpapi_no_match"] = True
+                    print("  |  ".join(results_log))
 
         html = generate_html(dest, rows, min_price=args.min_price)
         out_path = Path(args.out) if args.out else RESULTS_DIR / f"{dest}_report.html"
