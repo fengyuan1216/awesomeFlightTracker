@@ -219,6 +219,41 @@ def stop_label(n: int) -> str:
     return {0: "Nonstop", 1: "1 Stop", 99: "Unknown Stops (partial data)"}.get(n, f"{n} Stops")
 
 
+def verify_with_serpapi(
+    origin: str, dest: str, depart_date: str, return_date: str, api_key: str
+) -> float | None:
+    """One SerpApi call to spot-check a fast-flights price.
+
+    Returns the cheapest round-trip price found, or None on failure.
+    Uses no_cache=true so we get a live price, not a cached one.
+    """
+    import requests
+    params = {
+        "engine": "google_flights",
+        "departure_id": origin,
+        "arrival_id": dest,
+        "outbound_date": depart_date,
+        "adults": "1",
+        "currency": "USD",
+        "hl": "en",
+        "no_cache": "true",
+        "api_key": api_key,
+        "type": "1" if return_date else "2",
+    }
+    if return_date:
+        params["return_date"] = return_date
+    try:
+        resp = requests.get("https://serpapi.com/search", params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        all_flights = data.get("best_flights", []) + data.get("other_flights", [])
+        if all_flights:
+            return float(min(f.get("price", 999_999) for f in all_flights))
+    except Exception as exc:
+        print(f"  SerpApi verify failed ({exc})")
+    return None
+
+
 def _fmt_date_range(dates: list[str]) -> str:
     """Format a sorted list of YYYY-MM-DD dates compactly, e.g. 'Nov 21–27, 2026 (7)'."""
     if not dates:
@@ -374,6 +409,24 @@ def render_row(r: dict, rank: int, badges: str, gf_url: str) -> str:
                     else '<span class="source-ff">fast-flights</span>' if api_source == "fast-flights"
                     else "")
 
+    # SerpApi verification badge
+    serpapi_price = r.get("_serpapi_price")
+    verify_html = ""
+    if serpapi_price is not None:
+        delta = serpapi_price - r["price_numeric"]
+        if abs(delta) <= 50:
+            verify_html = (
+                f'<div class="verify-ok" title="SerpApi also found ${serpapi_price:,.0f} — within $50">'
+                f'✓ Verified by SerpApi</div>'
+            )
+        else:
+            sign = "+" if delta > 0 else ""
+            verify_html = (
+                f'<div class="verify-warn" title="SerpApi found ${serpapi_price:,.0f} — '
+                f'${abs(delta):.0f} difference">'
+                f'SerpApi: ${serpapi_price:,.0f} ({sign}{delta:.0f})</div>'
+            )
+
     return f"""
       <tr class="{row_class}">
         <td class="td-rank">{rank}</td>
@@ -381,6 +434,7 @@ def render_row(r: dict, rank: int, badges: str, gf_url: str) -> str:
         <td class="td-price">
           <span class="price-val">{r['price']}</span>
           <div class="badges">{badges}</div>
+          {verify_html}
           <div class="price-ts">{source_badge} as of {checked_at}</div>
         </td>
         <td class="td-leg"><div class="leg-block">{outbound_html}</div></td>
@@ -539,7 +593,7 @@ def build_section(stop_n: int, rows: list[dict]) -> str:
 # Full HTML page
 # ---------------------------------------------------------------------------
 
-def generate_html(destination: str, rows: list[dict]) -> str:
+def generate_html(destination: str, rows: list[dict], min_price: float | None = None) -> str:
     by_stops: dict[int, list[dict]] = {}
     for r in rows:
         by_stops.setdefault(r["stops_int"], []).append(r)
@@ -653,6 +707,19 @@ body {{
 .source-ff {{ display:inline-block; font-size:9px; font-weight:600; letter-spacing:.3px;
   background:#dbeafe; color:#1d4ed8; border-radius:3px; padding:1px 4px; margin-right:3px; }}
 .gf-note {{ font-size: 10px; color: #94a3b8; margin-top: 4px; line-height: 1.4; }}
+.verify-ok {{
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10px; font-weight: 700; color: #166534;
+  background: #dcfce7; border: 1px solid #86efac;
+  border-radius: 4px; padding: 2px 6px; margin-top: 3px;
+  letter-spacing: .02em;
+}}
+.verify-warn {{
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10px; font-weight: 600; color: #92400e;
+  background: #fef3c7; border: 1px solid #fcd34d;
+  border-radius: 4px; padding: 2px 6px; margin-top: 3px;
+}}
 
 /* ── Section ── */
 .stop-section {{
@@ -787,6 +854,7 @@ details[open] > table tbody tr:last-child {{ border-bottom: 1px solid #f1f5f9; }
     <div class="meta-item"><span class="label">Depart</span><span class="value">{_fmt_date_range(depart_dates)}</span></div>
     {return_meta}
     <div class="meta-item"><span class="label">Flights tracked</span><span class="value">{len(rows)}</span></div>
+    {"<div class='meta-item'><span class='label'>Target price</span><span class='value' style='color:" + ("#86efac" if overall_best["price_numeric"] <= min_price else "#fca5a5") + "'>$" + f"{min_price:,.0f}" + ("  ✓" if overall_best["price_numeric"] <= min_price else "  ✗") + "</span></div>" if min_price is not None else ""}
     <div class="meta-item"><span class="label">Generated</span><span class="value">{generated_at}</span></div>
   </div>
 </div>
@@ -865,13 +933,28 @@ def send_email(subject: str, html_body: str):
 # ---------------------------------------------------------------------------
 
 def main():
+    import os
     parser = argparse.ArgumentParser(description="Generate HTML flight report from saved CSVs.")
     parser.add_argument("--dest", nargs="+", metavar="IATA",
                         help="Destination(s) (default: all CSVs in results/)")
     parser.add_argument("--out", metavar="PATH", help="Output file (default: results/<DEST>_report.html)")
     parser.add_argument("--email", action="store_true",
                         help="Send the report(s) by email after generating")
+    parser.add_argument("--min-price", type=float, default=None, metavar="USD",
+                        help="Target price threshold shown in report header")
+    parser.add_argument("--verify-stops", type=int, default=1, metavar="N",
+                        help="Verify cheapest fast-flights result with ≤N stops via SerpApi (default: 1)")
     args = parser.parse_args()
+
+    # Load env for SERPAPI_KEY
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    serpapi_key = os.environ.get("SERPAPI_KEY")
 
     csv_files: list[Path] = []
     if args.dest:
@@ -895,15 +978,40 @@ def main():
             print(f"No usable rows in {csv_file.name}.")
             continue
 
-        html = generate_html(dest, rows)
+        # SerpApi verification: one call for the cheapest fast-flights row with ≤N stops.
+        # Only runs when a SERPAPI_KEY is available (fast-flights is always the primary source).
+        if serpapi_key:
+            ff_rows = [r for r in rows
+                       if r.get("api_source") == "fast-flights"
+                       and r.get("stops_int", 99) <= args.verify_stops]
+            if ff_rows:
+                target = min(ff_rows, key=lambda r: r["price_numeric"])
+                print(f"  Verifying {target['origin']}→{dest} {target['depart_date']} "
+                      f"(${target['price_numeric']:,.0f}) via SerpApi …", end=" ", flush=True)
+                serpapi_price = verify_with_serpapi(
+                    target["origin"], dest,
+                    target["depart_date"], target.get("return_date", ""),
+                    serpapi_key,
+                )
+                if serpapi_price is not None:
+                    delta = abs(serpapi_price - target["price_numeric"])
+                    status = "✓ verified" if delta <= 50 else f"⚠ gap ${delta:.0f}"
+                    print(f"SerpApi: ${serpapi_price:,.0f}  {status}")
+                    target["_serpapi_price"] = serpapi_price
+                else:
+                    print("no result")
+
+        html = generate_html(dest, rows, min_price=args.min_price)
         out_path = Path(args.out) if args.out else RESULTS_DIR / f"{dest}_report.html"
         out_path.write_text(html, encoding="utf-8")
         print(f"Report written → {out_path}")
 
         if args.email:
             best = min(rows, key=lambda r: r["price_numeric"])
+            below = args.min_price is not None and best["price_numeric"] <= args.min_price
+            alert_tag = " 🎯 Below target!" if below else ""
             subject = (
-                f"✈ Flight Alert {dest}: best {best['price']} "
+                f"✈ Flight Alert {dest}: best {best['price']}{alert_tag} "
                 f"({best['origin']}→{dest}, {best['depart_date']})"
             )
             send_email(subject, html)
