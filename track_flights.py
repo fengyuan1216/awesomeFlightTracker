@@ -402,60 +402,13 @@ def csv_path(destination: str) -> Path:
 
 def save_results(rows: list[dict], destination: str):
     path = csv_path(destination)
-
-    if path.exists():
-        with open(path, newline="") as f:
-            existing_fields = csv.DictReader(f).fieldnames or []
-        if existing_fields != FIELDNAMES:
-            with open(path, newline="") as f:
-                old_rows = list(csv.DictReader(f))
-            with open(path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(old_rows)
-            print(f"  Migrated {path.name} schema ({len(existing_fields)} → {len(FIELDNAMES)} columns)")
-
-    with open(path, "a", newline="") as f:
+    with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
-        if path.stat().st_size == 0:
-            writer.writeheader()
+        writer.writeheader()
         writer.writerows(rows)
     print(f"  Saved {len(rows)} result(s) → {path}")
 
 
-def show_history(destination: str):
-    path = csv_path(destination)
-    if not path.exists():
-        print(f"No history found for {destination} (expected {path})")
-        return
-    with open(path, newline="") as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        print("History file is empty.")
-        return
-
-    print(f"\n{'='*70}")
-    print(f"Price history for {destination.upper()} ({len(rows)} records)")
-    print(f"{'='*70}")
-
-    sessions: dict[str, list[dict]] = {}
-    for r in rows:
-        sessions.setdefault(r["checked_at"][:16], []).append(r)
-
-    for session_time, session_rows in sorted(sessions.items()):
-        valid = [r for r in session_rows if r.get("price_numeric")]
-        if not valid:
-            continue
-        cheapest = min(valid, key=lambda r: float(r["price_numeric"]))
-        print(f"  {session_time}  cheapest: {cheapest['price']:>12}  "
-              f"{cheapest['origin']}→{cheapest['destination']}  "
-              f"depart {cheapest['depart_date']}  "
-              f"{cheapest['stops']}  {cheapest['airline']}")
-
-    valid_rows = [r for r in rows if r.get("price_numeric")]
-    if valid_rows:
-        prices = [float(r["price_numeric"]) for r in valid_rows]
-        print(f"\n  All-time low: {min(prices):.0f}  |  Latest: {float(valid_rows[-1]['price_numeric']):.0f}")
 
 
 # ---------------------------------------------------------------------------
@@ -599,8 +552,6 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["fast-flights", "serpapi"],
                    default=os.environ.get("FLIGHT_API", "fast-flights"),
                    help="Flight data backend (default: $FLIGHT_API or fast-flights)")
-    p.add_argument("--history", action="store_true",
-                   help="Show saved price history (use --to to filter by destination)")
     return p
 
 
@@ -620,17 +571,6 @@ def main():
     args = parser.parse_args()
 
     serpapi_key = os.environ.get("SERPAPI_KEY")
-
-    if args.history:
-        if args.to:
-            show_history(args.to.upper())
-        else:
-            csv_files = sorted(RESULTS_DIR.glob("*.csv"))
-            if not csv_files:
-                print("No history found. Run a search first.")
-            for f in csv_files:
-                show_history(f.stem)
-        return
 
     if args.to:
         if not args.depart:
