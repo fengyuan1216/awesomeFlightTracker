@@ -13,10 +13,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$SCRIPT_DIR/results/cron.log"
 PYTHON="$(which python3)"
 
-# ── Departure airports per route (space-separated IATA codes) ────────────────
+# ── Backend & departure airports ─────────────────────────────────────────────
+# Set FLIGHT_API=serpapi to use SerpApi (requires SERPAPI_KEY in .env).
+# FLIGHT_API is read from .env automatically; override here if needed:
+# FLIGHT_API=serpapi
+
 ORIGINS_NZ="SEA YVR"   # AKL + ZQN searches
-ORIGINS_BOI="SEA PAE"           # BOI search
-ORIGINS_PVG="SEA YVR"       # PVG search
+ORIGINS_BOI="SEA PAE"  # BOI search
+ORIGINS_PVG="SEA YVR"  # PVG search
 
 # Load .env credentials into environment
 if [[ -f "$SCRIPT_DIR/.env" ]]; then

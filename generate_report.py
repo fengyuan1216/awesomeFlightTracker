@@ -8,6 +8,7 @@ Usage:
   python generate_report.py --dest AKL ZQN
   python generate_report.py --dest AKL --out report.html
 """
+from __future__ import annotations
 
 import argparse
 import csv
@@ -218,6 +219,26 @@ def stop_label(n: int) -> str:
     return {0: "Nonstop", 1: "1 Stop", 99: "Unknown Stops (partial data)"}.get(n, f"{n} Stops")
 
 
+def _fmt_date_range(dates: list[str]) -> str:
+    """Format a sorted list of YYYY-MM-DD dates compactly, e.g. 'Nov 21–27, 2026 (7)'."""
+    if not dates:
+        return ""
+    def _d(dt) -> str:
+        return f"{dt.strftime('%b')} {dt.day}"
+    if len(dates) == 1:
+        dt = datetime.strptime(dates[0], "%Y-%m-%d")
+        return f"{_d(dt)}, {dt.year}"
+    first = datetime.strptime(dates[0], "%Y-%m-%d")
+    last  = datetime.strptime(dates[-1], "%Y-%m-%d")
+    n = len(dates)
+    if first.year == last.year and first.month == last.month:
+        return f"{_d(first)}–{last.day}, {first.year} ({n})"
+    elif first.year == last.year:
+        return f"{_d(first)}–{_d(last)}, {first.year} ({n})"
+    else:
+        return f"{_d(first)}, {first.year}–{_d(last)}, {last.year} ({n})"
+
+
 def make_google_flights_url(origin: str, dest: str, depart_date: str,
                              return_date: str = "", adults: int = 1,
                              max_stops: int | None = None,
@@ -266,11 +287,12 @@ def fmt_datetime(dt_str: str, variant: str, ahead: str = "") -> str:
         return f'<span class="dt-wrap {variant} empty">—</span>'
     time_part, date_part = split_time_date(dt_str)
     ahead_html = f'<span class="ahead">+{ahead.lstrip("+")}</span>' if ahead else ""
-    date_html  = f'<div class="dt-date">{date_part}</div>' if date_part else ""
+    date_html  = f'<span class="dt-date">{date_part}</span>' if date_part else ""
+    time_html  = f'<span class="dt-time">{time_part}{ahead_html}</span>'
     return (
         f'<span class="dt-wrap {variant}">'
-        f'  <span class="dt-time">{time_part}{ahead_html}</span>'
         f'  {date_html}'
+        f'  {time_html}'
         f'</span>'
     )
 
@@ -279,7 +301,7 @@ def fmt_date_only(date_str: str, variant: str) -> str:
     """Render a date-only pill (when we only have the return date, no times)."""
     return (
         f'<span class="dt-wrap {variant}">'
-        f'  <span class="dt-time">{date_str}</span>'
+        f'  <span class="dt-date">{date_str}</span>'
         f'</span>'
     )
 
@@ -347,6 +369,10 @@ def render_row(r: dict, rank: int, badges: str, gf_url: str) -> str:
         row_class = "row-best"
 
     checked_at = r.get("checked_at", "")
+    api_source = r.get("api_source", "")
+    source_badge = ('<span class="source-serpapi">SerpApi</span>' if api_source == "serpapi"
+                    else '<span class="source-ff">fast-flights</span>' if api_source == "fast-flights"
+                    else "")
 
     return f"""
       <tr class="{row_class}">
@@ -355,7 +381,7 @@ def render_row(r: dict, rank: int, badges: str, gf_url: str) -> str:
         <td class="td-price">
           <span class="price-val">{r['price']}</span>
           <div class="badges">{badges}</div>
-          <div class="price-ts">as of {checked_at}</div>
+          <div class="price-ts">{source_badge} as of {checked_at}</div>
         </td>
         <td class="td-leg"><div class="leg-block">{outbound_html}</div></td>
         <td class="td-leg">{return_cell}</td>
@@ -443,7 +469,10 @@ def build_section(stop_n: int, rows: list[dict]) -> str:
         for i, r in enumerate(sub_rows, 1):
             stops_int = r.get("stops_int")
             max_stops = stops_int if isinstance(stops_int, int) and stops_int < 99 else None
-            codes = [code for _, code in parse_airlines(r.get("airline", "")) if code]
+            # Airline filter only for fast-flights rows (SerpApi names are already
+            # accurate; injecting IATA codes can over-filter the Google Flights link)
+            is_serpapi = r.get("api_source", "") == "serpapi"
+            codes = [] if is_serpapi else [code for _, code in parse_airlines(r.get("airline", "")) if code]
             gf_url = make_google_flights_url(
                 r["origin"], r["destination"], r["depart_date"], r.get("return_date", ""),
                 max_stops=max_stops, airline_codes=codes or None,
@@ -554,7 +583,7 @@ def generate_html(destination: str, rows: list[dict]) -> str:
 
     return_meta = (
         f'<div class="meta-item"><span class="label">Return</span>'
-        f'<span class="value">{", ".join(return_dates)}</span></div>'
+        f'<span class="value">{_fmt_date_range(return_dates)}</span></div>'
         if return_dates else ""
     )
 
@@ -619,6 +648,10 @@ body {{
 
 /* ── Price cell ── */
 .price-ts {{ font-size: 10px; color: #94a3b8; margin-top: 3px; }}
+.source-serpapi {{ display:inline-block; font-size:9px; font-weight:600; letter-spacing:.3px;
+  background:#ede9fe; color:#6d28d9; border-radius:3px; padding:1px 4px; margin-right:3px; }}
+.source-ff {{ display:inline-block; font-size:9px; font-weight:600; letter-spacing:.3px;
+  background:#dbeafe; color:#1d4ed8; border-radius:3px; padding:1px 4px; margin-right:3px; }}
 .gf-note {{ font-size: 10px; color: #94a3b8; margin-top: 4px; line-height: 1.4; }}
 
 /* ── Section ── */
@@ -695,9 +728,9 @@ td {{ padding: 10px 12px; vertical-align: top; }}
 .leg-arrow {{ color: #cbd5e1; font-size: 16px; flex-shrink: 0; }}
 /* shared pill */
 .dt-wrap {{
-  display: inline-flex; flex-direction: column;
+  display: inline-flex; flex-direction: row; align-items: baseline; gap: 5px;
   background: #f8fafc; border: 1px solid #e2e8f0;
-  border-radius: 6px; padding: 4px 8px; min-width: 76px;
+  border-radius: 6px; padding: 4px 8px;
 }}
 .dt-wrap.empty {{ background: none; border: 1px dashed #e2e8f0; color: #94a3b8; }}
 /* outbound: blue dep, green arr */
@@ -706,16 +739,16 @@ td {{ padding: 10px 12px; vertical-align: top; }}
 /* return: amber dep, violet arr */
 .dt-wrap.ret-dep {{ border-left: 3px solid #d97706; background: #fffbeb; }}
 .dt-wrap.ret-arr {{ border-left: 3px solid #7c3aed; background: #f5f3ff; }}
-.dt-time {{
-  font-family: 'DM Mono', 'SF Mono', 'Fira Code', monospace;
-  font-size: 13px; font-weight: 500; color: #0f172a;
-  white-space: nowrap; letter-spacing: 0.01em;
-  font-variant-numeric: tabular-nums;
-}}
 .dt-date {{
   font-family: 'DM Sans', -apple-system, sans-serif;
-  font-size: 11px; font-weight: 600; color: #374151;
-  white-space: nowrap; margin-top: 2px; letter-spacing: 0.01em;
+  font-size: 14px; font-weight: 700; color: #0f172a;
+  white-space: nowrap; letter-spacing: 0.01em;
+}}
+.dt-time {{
+  font-family: 'DM Mono', 'SF Mono', 'Fira Code', monospace;
+  font-size: 11px; font-weight: 400; color: #475569;
+  white-space: nowrap; letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
 }}
 .ahead {{ font-size: 10px; color: #dc2626; font-weight: 700; margin-left: 3px; }}
 .leg-meta {{ font-size: 11px; color: #64748b; margin-top: 5px; display: flex; align-items: center; gap: 6px; }}
@@ -751,7 +784,7 @@ details[open] > table tbody tr:last-child {{ border-bottom: 1px solid #f1f5f9; }
   <h1>✈ Flight Report — {destination} &nbsp;<small style="font-weight:400;font-size:14px;opacity:.7">{trip_type}</small></h1>
   <div class="meta">
     <div class="meta-item"><span class="label">Origins</span><span class="value">{" · ".join(origins)}</span></div>
-    <div class="meta-item"><span class="label">Depart</span><span class="value">{", ".join(depart_dates)}</span></div>
+    <div class="meta-item"><span class="label">Depart</span><span class="value">{_fmt_date_range(depart_dates)}</span></div>
     {return_meta}
     <div class="meta-item"><span class="label">Flights tracked</span><span class="value">{len(rows)}</span></div>
     <div class="meta-item"><span class="label">Generated</span><span class="value">{generated_at}</span></div>
