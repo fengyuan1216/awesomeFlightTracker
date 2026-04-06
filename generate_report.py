@@ -198,6 +198,8 @@ def load_csv(path: Path) -> list[dict]:
         key = (
             r["origin"],
             r["destination"],
+            r.get("depart_date", ""),
+            r.get("return_date", ""),
             _time_of_day(r.get("departure", "")),
             _time_of_day(r.get("arrival", "")),
             r.get("duration", ""),
