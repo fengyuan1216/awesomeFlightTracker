@@ -680,11 +680,10 @@ def build_section(stop_n: int, rows: list[dict]) -> str:
             html += render_row(r, i, badges, gf_url)
         return html
 
-    # Build visible rows
+    # Build visible rows (nonstop flights are all the same duration — skip Shortest)
     visible_html  = render_subsection("Top 3 Cheapest", top_cheap,  cheap_ids, short_ids)
-    # Remove from top_short any already shown in top_cheap
     extra_short = [r for r in top_short if id(r) not in cheap_ids]
-    if extra_short:
+    if extra_short and stop_n != 0:
         visible_html += render_subsection("Top 3 Shortest", extra_short, cheap_ids, short_ids)
 
     rest_html = ""
