@@ -9,7 +9,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$SCRIPT_DIR/results/cron.log"
-PYTHON="$(which python3)"
+PYTHON="/Users/yuanfeng/miniconda3/bin/python"
 
 # ── Backend & departure airports ─────────────────────────────────────────────
 # Tracker uses fast-flights by default (read from .env).
